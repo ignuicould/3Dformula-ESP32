@@ -1,3 +1,4 @@
+// Model taken from https://github.com/Max-Kawula/penger-obj
 const vs = [
     {x: -0.086914, y: 0.277547, z: 0.400041},
     {x: -0.069555, y: 0.329698, z: 0.376422},
