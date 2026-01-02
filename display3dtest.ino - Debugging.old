@@ -1,0 +1,244 @@
+#include <TFT_eSPI.h>
+#include "3dobject.h" // Include the 3D object data file (assumed to contain Vec3, vs, object_edges, NUM_EDGES)
+
+// Initialize the TFT_eSPI library object
+TFT_eSPI tft = TFT_eSPI();
+
+// --- DOUBLE BUFFERING SPRITE ---
+// Use a Sprite for double buffering to eliminate screen flicker (tearing).
+TFT_eSprite spr = TFT_eSprite(&tft);
+
+// --- Configuration ---
+// Color definitions (TFT_eSPI uses 16-bit color codes, often in HEX BGR format 0xBBGG)
+#define BACKGROUND_COLOR TFT_BLACK    // Dark background
+#define FOREGROUND_COLOR TFT_GREEN    // Bright green lines
+
+// The T-Display resolution is typically 240x135.
+int CANVAS_WIDTH;
+int CANVAS_HEIGHT;
+
+// Flag to indicate if the sprite was successfully allocated.
+bool spriteAllocated = false;
+
+// Global variables to track memory usage for reporting (Kept for setup logging)
+size_t initialFreeHeap = 0;
+size_t spriteMemoryUsed = 0;
+
+// FPS calculation variables
+uint32_t lastFPSTime = 0;
+int frameCount = 0;
+float currentFPS = 0.0f;
+
+
+// Define the 2D Point structure (for screen coordinates)
+// Vec3 is defined in cube_data.h
+struct Point2D {
+  int x, y;
+};
+
+// --- Global State for Animation ---
+float dz = 1.0f; // Z translation (distance from camera)
+float angle = 0.0f; // Current rotation angle (radians)
+
+// --- 3D Transformation Functions ---
+
+/**
+ * @brief Translates a 3D vector along the Z-axis.
+ */
+Vec3 translate_z(const Vec3& p, float delta_z) {
+  return {p.x, p.y, p.z + delta_z};
+}
+
+/**
+ * @brief Rotates a 3D vector around the Y-axis (equivalent to XZ plane rotation).
+ */
+Vec3 rotate_xz(const Vec3& p, float rotation_angle) {
+  float c = cosf(rotation_angle);
+  float s = sinf(rotation_angle);
+  return {
+    p.x * c - p.z * s,
+    p.y,
+    p.x * s + p.z * c
+  };
+}
+
+/**
+ * @brief Projects a 3D point onto the 2D viewing plane (Perspective Projection).
+ */
+Vec3 project(const Vec3& p) {
+  // Ensure we don't divide by a near-zero or negative Z value (clip plane)
+  // 0.001f acts as a near clipping plane. If behind or too close, return zero projection.
+  if (p.z < 0.01f) return {0.0f, 0.0f, 0.0f}; 
+  return {p.x / p.z, p.y / p.z, 0.0f};
+}
+
+/**
+ * @brief Maps the projected 2D coordinates (-1..1) to screen pixel coordinates (0..W/H).
+ */
+Point2D screen(const Vec3& p) {
+  // Scale from the projected -1..1 range to the screen pixel range.
+  return {
+    (int)round((p.x * 0.5f + 0.5f) * CANVAS_WIDTH),
+    // Invert Y-axis for standard screen coordinates (positive Y is down)
+    (int)round((0.5f - p.y * 0.5f) * CANVAS_HEIGHT) 
+  };
+}
+
+// --- Drawing Functions ---
+
+/**
+ * @brief Clears the Sprite to the background color. Uses fillSprite() for clarity.
+ */
+void clear_sprite() {
+  spr.fillSprite(BACKGROUND_COLOR);
+}
+
+/**
+ * @brief Draws a line between two screen points on the Sprite.
+ */
+void draw_line(const Point2D& p1, const Point2D& p2) {
+  // Check bounds before drawing (optional, but good practice)
+  if (p1.x >= 0 && p1.y >= 0 && p2.x >= 0 && p2.y >= 0 &&
+      p1.x <= CANVAS_WIDTH && p1.y <= CANVAS_HEIGHT && 
+      p2.x <= CANVAS_WIDTH && p2.y <= CANVAS_HEIGHT) {
+    spr.drawLine(p1.x, p1.y, p2.x, p2.y, FOREGROUND_COLOR);
+  }
+}
+
+// --- Main Animation Logic ---
+
+void frame() {
+  // Only proceed if the sprite was successfully allocated.
+  if (!spriteAllocated) {
+      delay(100);
+      return;
+  }
+
+  // 1. Update state (Rotation)
+  const float ROTATION_SPEED = 0.05f; 
+  angle += ROTATION_SPEED;
+  
+  // Keep angle within [0, 2*PI]
+  if (angle > TWO_PI) {
+    angle -= TWO_PI;
+  }
+
+  // 2. Clear the Sprite (Off-screen buffer)
+  clear_sprite();
+
+  // Draw Vertices
+  for (int i = 0; i < NUM_VERTICES; ++i) {
+    Point2D p = screen(project(translate_z(rotate_xz(vs[i], angle), dz)));
+    
+    // Draw a small 2x2 square or 1px point for each vertex
+    spr.fillRect(p.x - 1, p.y - 1, 3, 3, TFT_WHITE); 
+  }
+
+  // 3. Process and Draw Edges to the Sprite
+  for (int i = 0; i < NUM_EDGES; ++i) {
+    // Get the two vertex indices for the current edge
+    // NOTE: This assumes 'vs' is an array of Vec3 and 'object_edges' is an array of pairs of indices.
+    const Vec3& vA = vs[object_edges[i][0]]; 
+    const Vec3& vB = vs[object_edges[i][1]]; 
+
+    // Apply 3D transformations to point A: Rotate -> Translate -> Project
+    Vec3 tempA = rotate_xz(vA, angle);
+    tempA = translate_z(tempA, dz);
+    Vec3 projectedA = project(tempA);
+    Point2D screenA = screen(projectedA);
+
+    // Apply 3D transformations to point B: Rotate -> Translate -> Project
+    Vec3 tempB = rotate_xz(vB, angle);
+    tempB = translate_z(tempB, dz);
+    Vec3 projectedB = project(tempB);
+    Point2D screenB = screen(projectedB);
+
+    // Draw the line segment to the Sprite
+    draw_line(screenA, screenB);
+  }
+
+  // --- FPS Calculation and Display ---
+  frameCount++;
+  uint32_t currentTime = millis();
+  
+  // Check if one second has passed
+  if (currentTime - lastFPSTime >= 1000) {
+      // Calculate FPS: frameCount / (elapsed time / 1000)
+      currentFPS = (float)frameCount * 1000.0f / (currentTime - lastFPSTime);
+      lastFPSTime = currentTime;
+      frameCount = 0;
+  }
+
+  if (spriteAllocated) {
+      // Line: FPS Status
+      char fps_status[30];
+      // Display the calculated FPS
+      snprintf(fps_status, sizeof(fps_status), "FPS: %.1f", currentFPS);
+
+      // Draw the string on the top left corner of the sprite
+      spr.setTextColor(FOREGROUND_COLOR, BACKGROUND_COLOR);
+      spr.setTextSize(1); 
+      spr.drawString(fps_status, 5, 5); // Draw FPS at (5, 5)
+  }
+  
+  // 4. Push the fully rendered Sprite to the screen in one quick operation.
+  // This is the key step that prevents flicker.
+  spr.pushSprite(0, 0);
+
+  // 5. Wait for the next frame
+  //delay(16); // Aiming for roughly 60 FPS (1000ms / 60 = 16.6ms)
+  // STRIPPED FOR MAXIMUM FPS!!!
+}
+
+
+// --- Arduino Setup and Loop ---
+
+void setup() {
+  // Start serial for debugging
+  Serial.begin(115200);
+  Serial.println("Starting 3D Object Demo on T-Display");
+
+  // Initialize display and set orientation
+  tft.init();
+  tft.setRotation(1); // Set to landscape mode
+  
+  // Get the actual width and height after rotation
+  CANVAS_WIDTH = tft.width();
+  CANVAS_HEIGHT = tft.height();
+
+  Serial.printf("Display initialized: %dx%d\n", CANVAS_WIDTH, CANVAS_HEIGHT);
+
+  // --- MEMORY AND SPRITE ALLOCATION CHECK ---
+  // Get initial heap size (needed for memory calculation)
+  initialFreeHeap = ESP.getFreeHeap();
+  Serial.printf("Heap before Sprite allocation: %u bytes\n", initialFreeHeap);
+
+  // The size of the TFT_eSprite buffer is explicitly defined here using CANVAS_WIDTH and CANVAS_HEIGHT.
+  // This allocates the necessary memory for the off-screen buffer (240x135 at 16-bit color depth, ~65KB).
+  // The function returns 0 on success.
+  if (spr.createSprite(CANVAS_WIDTH, CANVAS_HEIGHT) == 0) {
+      Serial.println("Error: Failed to create 16-bit Sprite! Insufficient contiguous memory.");
+      // If allocation fails, print error on screen
+      tft.fillScreen(BACKGROUND_COLOR);
+      tft.setTextColor(TFT_RED, TFT_BLACK);
+      tft.drawString("Memory Error!", 0, 0, 2); 
+      spriteAllocated = false;
+  } else {
+      size_t heap_after = ESP.getFreeHeap();
+      spriteMemoryUsed = initialFreeHeap - heap_after;
+      
+      // Calculate and report memory usage (~65KB expected)
+      Serial.printf("16-bit Sprite created. Heap remaining: %u bytes (Used: %u bytes)\n", heap_after, spriteMemoryUsed);
+      spriteAllocated = true;
+      // Clear the sprite using fillSprite
+      spr.fillSprite(BACKGROUND_COLOR); 
+  }
+
+  // Initial clear (on the main screen)
+  tft.fillScreen(BACKGROUND_COLOR);
+}
+
+void loop() {
+  // The frame function is called repeatedly to animate the cube
+  frame();
+}
